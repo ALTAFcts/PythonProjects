@@ -27,17 +27,31 @@ from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, WebDriverException
 import trafilatura
 import time, random
+import multiprocessing
+import subprocess
+
 
 app = Flask(__name__)
-logging.disable(logging.WARNING)
-log = logging.getLogger('werkzeug')
-log.disabled = True
-classify = []
+#logging.disable(logging.WARNING)
+#log = logging.getLogger('werkzeug')
+#log.disabled = True
 
+classify = []
 model = SentenceTransformer("all-mpnet-base-v2")
 
+CHROMEDRIVER_PATH = ("D:/Python/Projects/FindMore/chromedriver_win32/chromedriver.exe")
 
-selenium_queue = queue.Queue()
+SELENIUM_PAGE_TIMEOUT = 30
+SELENIUM_HARD_TIMEOUT = 75
+SELENIUM_CLEANUP_TIMEOUT = 5
+MAX_SELENIUM_PROCESSES = 2
+
+logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s")
+
+log = logging.getLogger(__name__)
+
+# Prevent too many Chrome instances.
+selenium_semaphore = threading.BoundedSemaphore(MAX_SELENIUM_PROCESSES)
 
 
 def create_driver():
@@ -51,90 +65,163 @@ def create_driver():
     options.add_argument("--log-level=3")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
-    service = Service(
-        executable_path="D:/Python/Projects/FindMore/chromedriver_win32/chromedriver.exe"
-    )
+    # Don't wait for every image, stylesheet and other resource.
+    options.page_load_strategy = "eager"
+    service = Service(executable_path=CHROMEDRIVER_PATH)
 
     driver = webdriver.Chrome(
         service=service,
         options=options
     )
 
-    driver.set_page_load_timeout(60)
-    driver.set_script_timeout(20)
+    driver.set_page_load_timeout(SELENIUM_PAGE_TIMEOUT)
+    driver.set_script_timeout(15)
 
     return driver
 
-
-def get_with_retry(driver, url, retries=2):
-    for attempt in range(1, retries + 1):
-        try:
-            driver.get(url)
-            return
-        except TimeoutException:
-            raise                                   # let your existing handler salvage the DOM
-        except WebDriverException as e:
-            if "ERR_CONNECTION" in str(e) and attempt < retries:
-                wait = 2 ** attempt + random.uniform(0, 2)
-                print(f"Connection reset ({url}), retry {attempt}/{retries} in {wait:.0f}s")
-                time.sleep(wait)
-                continue
-            raise 
-
-def selenium_worker():
+def selenium_fetch_process(url, conn):
     driver = None
     try:
+        log.info("Selenium started: %s", url)
         driver = create_driver()
-        driver.set_page_load_timeout(30)
-        print("Selenium Chrome started")
-        while True:
-            job = selenium_queue.get()
+        timed_out = False
+        try:
+            driver.get(url)
+        except TimeoutException:
+            timed_out = True
+            log.warning("Page load timeout: %s",url)
+            # Try to stop further resource loading.
             try:
-                if job is None:
-                    break
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
 
-                url = job["url"]
-                result_queue = job["result_queue"]
-                timed_out = False
-                try:
-                    get_with_retry(driver, url)
-                except TimeoutException:
-                    timed_out = True
-                    print("PAGE LOAD TIMEOUT:", url)
-
-                    # Stop further loading and try to get partial HTML.
-                    try:
-                        driver.execute_script("window.stop();")
-                    except WebDriverException:
-                        pass
-
-                html = driver.page_source
-
-                result_queue.put({"ok": True,"html": html,"timed_out": timed_out})
-
-            except Exception as e:
-                if job is not None:
-                    job["result_queue"].put({"ok": False,"error": str(e)})
-            finally:
-                selenium_queue.task_done()
+        # Get available page HTML.
+        html = driver.page_source
+        conn.send({"ok": True,"html": html,"timed_out": timed_out})
+    except Exception as e:
+        log.exception("Selenium worker failed: %s",url)
+        try:
+            conn.send({"ok": False,"error": str(e)})
+        except Exception:
+            pass
     finally:
         if driver is not None:
             try:
                 driver.quit()
             except Exception as e:
-                print("Error closing Chrome:", e)
+                log.error("Chrome cleanup error: %s",str(e))
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-        print("Selenium Chrome stopped")
+        log.info("Selenium worker stopped: %s",url)
 
+def terminate_process_tree(process):
+    if process is None:
+        return
 
+    if not process.is_alive():
+        process.join(timeout=1)
+        return
 
-selenium_thread = threading.Thread(
-    target=selenium_worker,
-    daemon=True
-)
+    try:
+        # Windows: terminate worker and its child processes,
+        # including ChromeDriver and Chrome.
+        subprocess.run(
+            [
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F"
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False
+        )
+    except Exception as e:
+        log.error("Taskkill error: %s",str(e))
+        try:
+            process.terminate()
+        except Exception:
+            pass
 
-selenium_thread.start()
+    process.join(timeout=3)
+    if process.is_alive():
+        try:
+            process.kill()
+        except Exception:
+            pass
 
+        process.join(timeout=2)
+
+def get_selenium_html(url):
+    if not selenium_semaphore.acquire(timeout=10):
+        return {"ok": False,"error": "Maximum Selenium workers are busy"}
+
+    ctx = multiprocessing.get_context("spawn")
+
+    parent_conn = None
+    child_conn = None
+    process = None
+
+    try:
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(target=selenium_fetch_process,args=(url, child_conn))
+        process.start()
+        # Parent must close its copy of the child endpoint.
+        child_conn.close()
+        child_conn = None
+        # Wait for worker result.
+        if parent_conn.poll(SELENIUM_HARD_TIMEOUT):
+            try:
+                result = parent_conn.recv()
+            except EOFError:
+                result = {"ok": False,"error": "Selenium worker closed without result"}
+
+            # Allow graceful cleanup.
+            process.join(timeout=SELENIUM_CLEANUP_TIMEOUT)
+
+            # If Chrome cleanup is stuck, kill the process tree.
+            if process.is_alive():
+                log.warning("Selenium cleanup stuck. Killing process: %s",url)
+                terminate_process_tree(process)
+            return result
+        else:
+            log.error("SELENIUM HARD TIMEOUT: %s",url)
+            terminate_process_tree(process)
+            return {"ok": False,"error": "Selenium hard timeout"}
+    except Exception as e:
+        log.exception("Selenium execution error")
+        if process is not None:
+            terminate_process_tree(process)
+        return {"ok": False,"error": str(e)}
+    finally:
+        if parent_conn is not None:
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+
+        if child_conn is not None:
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+
+        if process is not None:
+            if process.is_alive():
+                terminate_process_tree(process)
+
+            try:
+                process.close()
+            except Exception:
+                pass
+
+        selenium_semaphore.release()
 
 @app.route("/hello")
 def hello():
@@ -213,11 +300,14 @@ def HttpUrlContent():
         html = res["content"]
 
     if(html is None or html == ""):        
-        result_queue = queue.Queue()
-        selenium_queue.put({"url": urlpath,"result_queue": result_queue})
-        result = result_queue.get()
+        log.info("HTTP failed. Trying Selenium: %s",urlpath)
+        result = get_selenium_html(urlpath)
+       
         if result["ok"]:
-            html = result["html"]             
+            html = result["html"]     
+
+        if result.get("timed_out"):        
+            log.warning("Using partial HTML after page timeout: %s",urlpath)        
 
     if(len(html) !=  0):
         text =''
@@ -227,9 +317,7 @@ def HttpUrlContent():
         result_ = soup.get_text(separator=" ", strip=True)
         if(len(result_) < 200):
             if(bfromhttp):
-                result_queue = queue.Queue()
-                selenium_queue.put({"url": urlpath,"result_queue": result_queue})
-                result = result_queue.get()
+                result = get_selenium_html(urlpath)
                 if result["ok"]:
                     html = result["html"] 
             
@@ -246,8 +334,10 @@ def HttpUrlContent():
                     include_images=False,
                     favor_precision=True
                     )            
-           
-        html = text.replace("\"","")
+        if(text is None or text == ""): 
+            return result_
+        else:
+            html = text.replace("\"","")
 
     return html
 
@@ -299,6 +389,7 @@ def SearchGoogleContent():
 #     return trans
 
 if __name__ == '__main__':    
+    multiprocessing.freeze_support()
     app.run(host='127.0.0.1',port=5001,debug=True)
     
 
